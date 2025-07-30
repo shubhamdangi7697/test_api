@@ -1,0 +1,919 @@
+from fastapi import FastAPI, HTTPException, BackgroundTasks
+from pydantic import BaseModel
+from pymongo import MongoClient
+from typing import List, Dict, Optional
+import os
+import uuid
+from datetime import datetime
+import random
+import json
+import asyncio
+import google.generativeai as genai
+
+app = FastAPI(title="AWS DVA-C02 Practice Exam Generator with Gemini")
+
+# MongoDB Setup
+mongo_client = MongoClient(os.getenv("MONGO_URI", "mongodb+srv://shubhamdmca:OdS48xyWAmxO3Q0H@cluster0.ng5gagk.mongodb.net/?retryWrites=true&w=majority&appName=Cluster0"))
+db = mongo_client.aws_prep
+
+# Gemini API Keys Configuration (4 keys for rotation)
+GEMINI_API_KEYS = [
+    os.getenv("GEMINI_API_KEY_1", "AIzaSyBbFzTgymccDHpnz0d9uL0er_Agixqph7Q"),
+    os.getenv("GEMINI_API_KEY_2", "AIzaSyATPhsyIxL6Y4OX5akXgjM_2H4cDeovLK4"), 
+    os.getenv("GEMINI_API_KEY_3", "AIzaSyBm35TCuGjw50ejA12teB8IKYAmJQrbwr4"),
+    os.getenv("GEMINI_API_KEY_4", "AIzaSyCpPGMjwYMzdaSv3-FGgnoyHtGnvfI_ByM")
+]
+
+current_key_index = 0
+
+# Data Models
+class OptionExplanation(BaseModel):
+    option: str
+    explanation: str
+    is_correct: bool
+
+class AWSQuestion(BaseModel):
+    question_id: str
+    domain: str
+    task: str
+    question: str
+    options: List[str]
+    correct_answer: str
+    explanation: str
+    difficulty: str
+    aws_services: List[str]
+    option_explanations: List[OptionExplanation]
+
+class PracticeSet(BaseModel):
+    set_id: str
+    exam_id: str = "01"  # AWS exam identifier
+    set_number: int
+    difficulty_level: str  # easy, medium, hard
+    topic: str = "AWS Certified Developer Associate"
+    version: str = "DVA-C02"
+    questions: List[AWSQuestion]
+    created_at: datetime
+    total_questions: int = 65
+
+# AWS DVA-C02 Domains Configuration
+AWS_DOMAINS = {
+    "development": {
+        "weight": 0.32,
+        "questions_per_set": 21,
+        "tasks": [
+            "Develop code for applications hosted on AWS",
+            "Develop code for AWS Lambda", 
+            "Use data stores in application development"
+        ],
+        "services": ["Lambda", "API Gateway", "DynamoDB", "S3", "SQS", "SNS", "Kinesis", "Step Functions"],
+        "concepts": ["Event-driven architecture", "Microservices", "Serverless", "APIs", "SDKs"]
+    },
+    "security": {
+        "weight": 0.26,
+        "questions_per_set": 17,
+        "tasks": [
+            "Implement authentication and authorization",
+            "Implement encryption using AWS services",
+            "Manage sensitive data in application code"
+        ],
+        "services": ["IAM", "Cognito", "KMS", "Secrets Manager", "STS", "Certificate Manager"],
+        "concepts": ["Least privilege", "RBAC", "Encryption", "JWT", "OAuth", "SAML"]
+    },
+    "deployment": {
+        "weight": 0.24,
+        "questions_per_set": 16,
+        "tasks": [
+            "Prepare application artifacts for deployment",
+            "Test applications in development environments",
+            "Automate deployment testing",
+            "Deploy code using AWS CI/CD services"
+        ],
+        "services": ["CodePipeline", "CodeBuild", "CodeDeploy", "CloudFormation", "SAM", "CDK"],
+        "concepts": ["CI/CD", "Blue/green deployment", "Canary deployment", "IaC", "Testing"]
+    },
+    "troubleshooting": {
+        "weight": 0.18,
+        "questions_per_set": 11,
+        "tasks": [
+            "Assist in root cause analysis",
+            "Instrument code for observability",
+            "Optimize applications using AWS services"
+        ],
+        "services": ["CloudWatch", "X-Ray", "CloudTrail", "ElastiCache", "Config"],
+        "concepts": ["Monitoring", "Logging", "Tracing", "Performance optimization", "Debugging"]
+    }
+}
+
+# AWS Exam Syllabus for Reference
+AWS_EXAM_SYLLABUS = """
+AWS Certified Developer Associate (DVA-C02) Exam Syllabus:
+
+Domain 1: Development with AWS Services (32%)
+- Develop code for applications hosted on AWS
+- Develop code for AWS Lambda
+- Use data stores in application development
+
+Domain 2: Security (26%)
+- Implement authentication and authorization for AWS services and applications
+- Implement encryption using AWS services
+- Manage sensitive data in application code
+
+Domain 3: Deployment (24%)
+- Prepare application artifacts to be deployed to AWS
+- Test applications in development environments
+- Automate deployment testing
+- Deploy code using AWS CI/CD services
+
+Domain 4: Troubleshooting and Optimization (18%)
+- Assist in a root cause analysis
+- Instrument code for observability
+- Optimize applications by using AWS services and features
+
+Key AWS Services: Lambda, API Gateway, DynamoDB, S3, SQS, SNS, Kinesis, IAM, Cognito, KMS, CloudFormation, CodePipeline, CodeBuild, CodeDeploy, CloudWatch, X-Ray, ElastiCache, RDS, EC2, VPC, and more.
+"""
+
+# Gemini LLM Integration with Key Rotation
+class GeminiLLMGenerator:
+    def __init__(self):
+        self.api_keys = GEMINI_API_KEYS
+        self.current_key_index = 0
+        self._initialize_gemini()
+    
+    def _initialize_gemini(self):
+        """Initialize Gemini with current API key"""
+        try:
+            genai.configure(api_key=self.api_keys[self.current_key_index])
+            self.model = genai.GenerativeModel('gemini-1.5-flash')
+        except Exception as e:
+            print(f"Error initializing Gemini with key {self.current_key_index}: {str(e)}")
+            self._rotate_api_key()
+    
+    def _rotate_api_key(self):
+        """Rotate to next API key"""
+        global current_key_index
+        current_key_index = (current_key_index + 1) % len(self.api_keys)
+        self.current_key_index = current_key_index
+        try:
+            genai.configure(api_key=self.api_keys[self.current_key_index])
+            self.model = genai.GenerativeModel('gemini-1.5-flash')
+            print(f"Rotated to API key {self.current_key_index}")
+        except Exception as e:
+            print(f"Error with API key {self.current_key_index}: {str(e)}")
+    
+    async def generate_questions(self, prompt: str, max_retries: int = 4) -> str:
+        """Generate questions using Gemini LLM with key rotation"""
+        for attempt in range(max_retries):
+            try:
+                response = self.model.generate_content(prompt)
+                return response.text
+            except Exception as e:
+                print(f"Attempt {attempt + 1} failed with key {self.current_key_index}: {str(e)}")
+                if attempt < max_retries - 1:
+                    self._rotate_api_key()
+                    await asyncio.sleep(1)
+                else:
+                    raise Exception(f"All API keys failed: {str(e)}")
+
+# AWS Question Generator
+class AWSExamGenerator:
+    def __init__(self):
+        self.llm = GeminiLLMGenerator()
+    
+    async def generate_domain_questions(self, domain: str, count: int, set_number: int, difficulty: str) -> List[AWSQuestion]:
+        """Generate questions for specific AWS certification domain"""
+        domain_config = AWS_DOMAINS[domain]
+        
+        prompt = f"""
+You are an expert AWS Certified Developer Associate exam creator. Generate {count} realistic DVA-C02 exam questions.
+
+EXAM CONTEXT:
+{AWS_EXAM_SYLLABUS}
+
+REQUIREMENTS:
+- Domain: {domain.title()} ({domain_config['weight']*100}% of exam)
+- Difficulty Level: {difficulty}
+- Practice Set: #{set_number}
+- Questions must be UNIQUE and exam-realistic
+- Follow exact DVA-C02 format and style
+
+FOCUS AREAS:
+- Tasks: {', '.join(domain_config['tasks'])}
+- AWS Services: {', '.join(domain_config['services'])}
+- Key Concepts: {', '.join(domain_config['concepts'])}
+
+DIFFICULTY GUIDELINES:
+- Easy: Basic service features, simple configurations, straightforward scenarios
+- Medium: Multi-service integrations, moderate complexity, common patterns
+- Hard: Complex architectures, edge cases, advanced configurations, troubleshooting
+
+QUESTION REQUIREMENTS:
+- Real-world scenarios with practical use cases
+- Code snippets, AWS CLI commands, JSON configurations where appropriate
+- Specific AWS service configurations and parameters
+- Error scenarios and troubleshooting
+- Security best practices and IAM policies
+- Performance optimization scenarios
+
+OUTPUT FORMAT (MUST be valid JSON):
+{{
+    "questions": [
+        {{
+            "question": "Detailed scenario-based question with realistic context...",
+            "options": ["A. First option", "B. Second option", "C. Third option", "D. Fourth option"],
+            "correct_answer": "C. Third option",
+            "explanation": "Comprehensive explanation of why this is correct with AWS documentation references...",
+            "difficulty": "{difficulty}",
+            "aws_services": ["Service1", "Service2"],
+            "task": "Specific task from domain",
+            "option_explanations": [
+                {{
+                    "option": "A. First option",
+                    "explanation": "Detailed explanation of why this option is incorrect/correct...",
+                    "is_correct": false
+                }},
+                {{
+                    "option": "B. Second option", 
+                    "explanation": "Detailed explanation of why this option is incorrect/correct...",
+                    "is_correct": false
+                }},
+                {{
+                    "option": "C. Third option",
+                    "explanation": "Detailed explanation of why this is the correct answer...",
+                    "is_correct": true
+                }},
+                {{
+                    "option": "D. Fourth option",
+                    "explanation": "Detailed explanation of why this option is incorrect/correct...",
+                    "is_correct": false
+                }}
+            ]
+        }}
+    ]
+}}
+
+Generate exactly {count} questions following this format. Ensure each question tests practical AWS knowledge and follows DVA-C02 exam patterns.
+"""
+        
+        try:
+            response = await self.llm.generate_questions(prompt)
+            questions = self._parse_llm_response(response, domain, difficulty)
+            return questions
+            
+        except Exception as e:
+            print(f"Error generating questions for {domain}: {str(e)}")
+            return []
+    
+    def _parse_llm_response(self, response: str, domain: str, difficulty: str) -> List[AWSQuestion]:
+        """Parse LLM response into AWSQuestion objects"""
+        questions = []
+        
+        try:
+            # Clean response and extract JSON
+            json_start = response.find('{')
+            json_end = response.rfind('}') + 1
+            
+            if json_start == -1 or json_end == 0:
+                print(f"No JSON found in response: {response[:200]}...")
+                return questions
+            
+            json_str = response[json_start:json_end]
+            data = json.loads(json_str)
+            
+            for q_data in data.get('questions', []):
+                # Parse option explanations
+                option_explanations = []
+                for opt_exp in q_data.get('option_explanations', []):
+                    option_explanations.append(OptionExplanation(
+                        option=opt_exp.get('option', ''),
+                        explanation=opt_exp.get('explanation', ''),
+                        is_correct=opt_exp.get('is_correct', False)
+                    ))
+                
+                question = AWSQuestion(
+                    question_id=str(uuid.uuid4()),
+                    domain=domain,
+                    task=q_data.get('task', ''),
+                    question=q_data.get('question', ''),
+                    options=q_data.get('options', []),
+                    correct_answer=q_data.get('correct_answer', ''),
+                    explanation=q_data.get('explanation', ''),
+                    difficulty=difficulty,
+                    aws_services=q_data.get('aws_services', []),
+                    option_explanations=option_explanations
+                )
+                questions.append(question)
+                
+        except json.JSONDecodeError as e:
+            print(f"JSON parsing error: {str(e)}")
+            print(f"Response: {response[:500]}...")
+        except Exception as e:
+            print(f"Error parsing response: {str(e)}")
+            
+        return questions
+
+# Main endpoint to generate AWS exam sets by difficulty
+@app.post("/generate-aws-exam-sets")
+async def generate_aws_exam_sets(background_tasks: BackgroundTasks):
+    """Generate 8 easy, 8 medium, and 8 hard AWS DVA-C02 practice exam sets"""
+    try:
+        # Check if sets already exist
+        existing_count = db.practice_sets.count_documents({"exam_id": "01"})
+        if existing_count >= 24:
+            return {
+                "message": "AWS practice sets already exist (8 easy + 8 medium + 8 hard)",
+                "existing_sets": existing_count,
+                "use_endpoint": "/list-aws-sets"
+            }
+        
+        # Validate Gemini API keys
+        if not any(GEMINI_API_KEYS):
+            raise HTTPException(
+                status_code=400, 
+                detail="At least one GEMINI_API_KEY environment variable is required"
+            )
+        
+        # Start background generation
+        generator = AWSExamGenerator()
+        background_tasks.add_task(
+            generate_aws_sets_background, 
+            generator
+        )
+        
+        return {
+            "message": "Generating AWS DVA-C02 practice sets using Gemini LLM",
+            "sets_to_generate": {
+                "easy": 8,
+                "medium": 8, 
+                "hard": 8,
+                "total": 24
+            },
+            "total_questions": 24 * 65,
+            "estimated_completion": "30-45 minutes",
+            "check_status": "/aws-generation-status",
+            "exam_id": "01"
+        }
+        
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+async def generate_aws_sets_background(generator: AWSExamGenerator):
+    """Background task to generate all AWS practice sets"""
+    difficulties = ["easy", "medium", "hard"]
+    
+    for difficulty in difficulties:
+        for set_number in range(1, 9):  # 8 sets per difficulty
+            try:
+                print(f"Generating {difficulty} practice set {set_number}/8...")
+                
+                practice_set = await generate_single_aws_set(generator, set_number, difficulty)
+                
+                # Store in MongoDB
+                db.practice_sets.insert_one(practice_set.dict())
+                print(f"{difficulty.title()} practice set {set_number} completed and stored")
+                
+                # Delay to avoid rate limiting
+                await asyncio.sleep(3)
+                
+            except Exception as e:
+                print(f"Error generating {difficulty} set {set_number}: {str(e)}")
+                continue
+
+async def generate_single_aws_set(generator: AWSExamGenerator, set_number: int, difficulty: str) -> PracticeSet:
+    """Generate a single practice set with 65 questions"""
+    all_questions = []
+    
+    # Generate questions for each domain
+    for domain, config in AWS_DOMAINS.items():
+        questions_needed = config["questions_per_set"]
+        
+        print(f"Generating {questions_needed} {difficulty} questions for {domain} domain...")
+        domain_questions = await generator.generate_domain_questions(
+            domain, questions_needed, set_number, difficulty
+        )
+        all_questions.extend(domain_questions)
+    
+    # Ensure we have exactly 65 questions
+    while len(all_questions) < 65:
+        extra_questions = await generator.generate_domain_questions(
+            "development", 65 - len(all_questions), set_number, difficulty
+        )
+        all_questions.extend(extra_questions)
+    
+    # Limit to exactly 65 questions
+    all_questions = all_questions[:65]
+    
+    # Shuffle questions
+    random.shuffle(all_questions)
+    
+    return PracticeSet(
+        set_id=str(uuid.uuid4()),
+        exam_id="01",
+        set_number=set_number,
+        difficulty_level=difficulty,
+        questions=all_questions,
+        created_at=datetime.now(),
+        total_questions=len(all_questions)
+    )
+
+# Endpoints for managing AWS exam sets
+@app.get("/list-aws-sets")
+async def list_aws_practice_sets():
+    """List all AWS practice sets grouped by difficulty"""
+    try:
+        sets = list(db.practice_sets.find(
+            {"exam_id": "01"}, 
+            {"set_id": 1, "set_number": 1, "difficulty_level": 1, "created_at": 1, "total_questions": 1}
+        ).sort([("difficulty_level", 1), ("set_number", 1)]))
+        
+        # Group by difficulty
+        grouped_sets = {"easy": [], "medium": [], "hard": []}
+        for s in sets:
+            difficulty = s.get("difficulty_level", "medium")
+            grouped_sets[difficulty].append({
+                "set_id": s["set_id"],
+                "set_number": s["set_number"],
+                "total_questions": s["total_questions"],
+                "created_at": s["created_at"]
+            })
+        
+        return {
+            "exam_id": "01",
+            "exam_name": "AWS Certified Developer Associate",
+            "total_sets": len(sets),
+            "sets_by_difficulty": grouped_sets,
+            "summary": {
+                "easy_sets": len(grouped_sets["easy"]),
+                "medium_sets": len(grouped_sets["medium"]),
+                "hard_sets": len(grouped_sets["hard"])
+            }
+        }
+        
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/aws-generation-status")
+async def get_aws_generation_status():
+    """Check the status of AWS practice set generation"""
+    try:
+        total_sets = db.practice_sets.count_documents({"exam_id": "01"})
+        easy_sets = db.practice_sets.count_documents({"exam_id": "01", "difficulty_level": "easy"})
+        medium_sets = db.practice_sets.count_documents({"exam_id": "01", "difficulty_level": "medium"}) 
+        hard_sets = db.practice_sets.count_documents({"exam_id": "01", "difficulty_level": "hard"})
+        
+        return {
+            "exam_id": "01",
+            "sets_generated": total_sets,
+            "target_sets": 24,
+            "progress_percentage": round((total_sets / 24) * 100, 1),
+            "status": "Completed" if total_sets >= 24 else "In Progress",
+            "difficulty_breakdown": {
+                "easy": f"{easy_sets}/8",
+                "medium": f"{medium_sets}/8", 
+                "hard": f"{hard_sets}/8"
+            },
+            "remaining": max(0, 24 - total_sets)
+        }
+        
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/aws-set/{difficulty}/{set_number}")
+async def get_aws_practice_set(difficulty: str, set_number: int):
+    """Get a specific AWS practice set by difficulty and number"""
+    try:
+        if difficulty not in ["easy", "medium", "hard"]:
+            raise HTTPException(
+                status_code=400, 
+                detail="Difficulty must be 'easy', 'medium', or 'hard'"
+            )
+        
+        if set_number < 1 or set_number > 8:
+            raise HTTPException(
+                status_code=400, 
+                detail="Set number must be between 1 and 8"
+            )
+        
+        practice_set = db.practice_sets.find_one({
+            "exam_id": "01",
+            "difficulty_level": difficulty,
+            "set_number": set_number
+        })
+        
+        if not practice_set:
+            raise HTTPException(
+                status_code=404, 
+                detail=f"AWS {difficulty} practice set {set_number} not found"
+            )
+        
+        # Remove MongoDB _id field
+        practice_set.pop('_id', None)
+        
+        return practice_set
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.delete("/clear-aws-sets")
+async def clear_aws_practice_sets():
+    """Clear all AWS practice sets"""
+    try:
+        result = db.practice_sets.delete_many({"exam_id": "01"})
+        
+        return {
+            "message": "All AWS practice sets cleared",
+            "deleted_count": result.deleted_count
+        }
+        
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+
+
+
+
+# Add this to your existing imports
+from typing import List, Dict, Any
+
+# Add this new endpoint to your FastAPI app
+@app.post("/generate-all-exam-info")
+async def generate_all_exam_info(background_tasks: BackgroundTasks):
+    """Extract exam names from test database and generate detailed info using LLM"""
+    try:
+        # Extract exam names from your test database categories
+        categories = list(db.categories.find({}, {"name": 1, "exams": 1}))
+        
+        all_exam_names = []
+        category_mapping = {}
+        
+        # Extract all exam names and map to categories
+        for category in categories:
+            category_name = category.get("name", "")
+            exams_array = category.get("exams", [])
+            
+            for exam in exams_array:
+                if isinstance(exam, str) and exam.strip():
+                    all_exam_names.append(exam.strip())
+                    category_mapping[exam.strip()] = category_name
+        
+        # Remove duplicates while preserving order
+        unique_exam_names = list(dict.fromkeys(all_exam_names))
+        
+        # Check how many already exist
+        existing_count = db.exam_info.count_documents({})
+        
+        if not unique_exam_names:
+            return {
+                "error": "No exam names found in test database categories",
+                "check_collection": "categories",
+                "suggestion": "Verify that categories collection has exams array"
+            }
+        
+        # Start background task to generate exam info
+        background_tasks.add_task(
+            generate_exam_info_background,
+            unique_exam_names,
+            category_mapping
+        )
+        
+        return {
+            "message": "Generating detailed exam information using LLM",
+            "total_exams_found": len(unique_exam_names),
+            "exams_to_process": unique_exam_names[:10],  # Show first 10
+            "total_categories": len(categories),
+            "existing_exam_info": existing_count,
+            "estimated_completion": f"{len(unique_exam_names) * 1}-{len(unique_exam_names) * 2} minutes",
+            "check_status": "/exam-info-generation-status",
+            "target_collection": "test.exam_info"
+        }
+        
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+async def generate_exam_info_background(exam_names: List[str], category_mapping: Dict[str, str]):
+    """Background task to generate exam info for all exams using LLM"""
+    total_exams = len(exam_names)
+    processed = 0
+    errors = []
+    
+    # Initialize LLM generator
+    llm = GeminiLLMGenerator()
+    
+    for index, exam_name in enumerate(exam_names, 1):
+        try:
+            print(f"Processing exam {index}/{total_exams}: {exam_name}")
+            
+            # Check if exam info already exists
+            existing_exam = db.exam_info.find_one({"name": exam_name})
+            if existing_exam:
+                print(f"Exam '{exam_name}' already exists, skipping...")
+                processed += 1
+                continue
+            
+            # Generate exam details using LLM
+            exam_info = await generate_single_exam_info(llm, exam_name, category_mapping.get(exam_name, "General"))
+            
+            if exam_info:
+                # Store in test.exam_info collection
+                db.exam_info.insert_one(exam_info)
+                processed += 1
+                print(f"Exam '{exam_name}' processed and stored ({index}/{total_exams})")
+            else:
+                errors.append(f"Failed to generate info for: {exam_name}")
+            
+            # Delay to avoid rate limiting
+            await asyncio.sleep(2)
+            
+        except Exception as e:
+            error_msg = f"Error processing {exam_name}: {str(e)}"
+            print(error_msg)
+            errors.append(error_msg)
+            continue
+    
+    print(f"Completed processing {processed}/{total_exams} exams")
+    if errors:
+        print(f"Errors encountered: {len(errors)}")
+        for error in errors[:5]:  # Print first 5 errors
+            print(f"  - {error}")
+
+async def generate_single_exam_info(llm: GeminiLLMGenerator, exam_name: str, category: str) -> Dict[str, Any]:
+    """Generate detailed exam information for a single exam using LLM"""
+    
+    prompt = f"""
+You are an expert exam researcher. Research and provide accurate, realistic details for the exam: "{exam_name}"
+
+IMPORTANT: Provide REAL exam details based on actual exam specifications. Do not make up information.
+
+Research the following details:
+1. Full official exam name
+2. Brief description of what the exam tests
+3. Duration in minutes (typical exam duration)
+4. Total number of questions
+5. Difficulty level (Easy/Medium/Hard)
+6. Approximate number of annual participants (if known)
+7. Exam type (Multiple Choice, Descriptive, Mixed, etc.)
+8. Number of attempts allowed (Unlimited, Limited, etc.)
+9. 8-10 realistic exam instructions
+10. 3-4 related exams in the same field
+
+Category Context: {category}
+
+OUTPUT FORMAT (MUST be valid JSON):
+{{
+    "name": "{exam_name}",
+    "description": "Brief description of what this exam tests and its purpose",
+    "durationMinutes": 120,
+    "totalQuestions": 100,
+    "difficulty": "Medium",
+    "participants": 50000,
+    "category": "{category}",
+    "level": "Entry/Associate/Professional",
+    "type": "Multiple Choice",
+    "attempts": "Unlimited",
+    "instructions": [
+        "Total time allowed: X minutes",
+        "Total questions: X",
+        "Each question carries equal marks",
+        "Read all instructions carefully",
+        "Manage your time effectively",
+        "Review answers before submission",
+        "Ensure stable internet connection",
+        "Do not refresh browser during exam"
+    ],
+    "relatedExams": [
+        {{
+            "name": "Related Exam 1",
+            "totalQuestions": 100,
+            "durationMinutes": 120
+        }},
+        {{
+            "name": "Related Exam 2", 
+            "totalQuestions": 150,
+            "durationMinutes": 180
+        }}
+    ],
+    "isActive": true
+}}
+
+Research real exam specifications and provide accurate information. If exact details are not available, use reasonable estimates based on similar exams in the same category.
+"""
+    
+    try:
+        response = await llm.generate_questions(prompt)
+        exam_data = parse_exam_info_response(response, exam_name, category)
+        return exam_data
+        
+    except Exception as e:
+        print(f"Error generating exam info for {exam_name}: {str(e)}")
+        return None
+
+def parse_exam_info_response(response: str, exam_name: str, category: str) -> Dict[str, Any]:
+    """Parse LLM response into exam info dictionary"""
+    try:
+        # Clean response and extract JSON
+        json_start = response.find('{')
+        json_end = response.rfind('}') + 1
+        
+        if json_start == -1 or json_end == 0:
+            print(f"No JSON found in response for {exam_name}")
+            return create_fallback_exam_info(exam_name, category)
+        
+        json_str = response[json_start:json_end]
+        data = json.loads(json_str)
+        
+        # Add required fields
+        exam_info = {
+            "_id": str(uuid.uuid4()),
+            "name": data.get("name", exam_name),
+            "description": data.get("description", f"Practice exam for {exam_name}"),
+            "durationMinutes": data.get("durationMinutes", 120),
+            "totalQuestions": data.get("totalQuestions", 100),
+            "difficulty": data.get("difficulty", "Medium"),
+            "participants": data.get("participants", 10000),
+            "category": data.get("category", category),
+            "level": data.get("level", "Medium"),
+            "type": data.get("type", "Multiple Choice"),
+            "attempts": data.get("attempts", "Unlimited"),
+            "instructions": data.get("instructions", [
+                f"Total time allowed: {data.get('durationMinutes', 120)} minutes",
+                f"Total questions: {data.get('totalQuestions', 100)}",
+                "Each question carries equal marks",
+                "Read all instructions carefully before starting",
+                "Manage your time effectively",
+                "Review your answers before final submission",
+                "Ensure you have a stable internet connection",
+                "Do not refresh or close the browser during exam"
+            ]),
+            "relatedExams": data.get("relatedExams", []),
+            "isActive": data.get("isActive", True),
+            "createdAt": datetime.now(),
+            "updatedAt": datetime.now()
+        }
+        
+        return exam_info
+        
+    except json.JSONDecodeError as e:
+        print(f"JSON parsing error for {exam_name}: {str(e)}")
+        return create_fallback_exam_info(exam_name, category)
+    except Exception as e:
+        print(f"Error parsing response for {exam_name}: {str(e)}")
+        return create_fallback_exam_info(exam_name, category)
+
+def create_fallback_exam_info(exam_name: str, category: str) -> Dict[str, Any]:
+    """Create fallback exam info when LLM response fails"""
+    return {
+        "_id": str(uuid.uuid4()),
+        "name": exam_name,
+        "description": f"Practice examination for {exam_name}",
+        "durationMinutes": 120,
+        "totalQuestions": 100,
+        "difficulty": "Medium",
+        "participants": 10000,
+        "category": category,
+        "level": "Medium",
+        "type": "Multiple Choice",
+        "attempts": "Unlimited",
+        "instructions": [
+            "Total time allowed: 120 minutes",
+            "Total questions: 100",
+            "Each question carries equal marks",
+            "Read all instructions carefully before starting",
+            "Manage your time effectively",
+            "Review your answers before final submission",
+            "Ensure you have a stable internet connection",
+            "Do not refresh or close the browser during exam"
+        ],
+        "relatedExams": [],
+        "isActive": True,
+        "createdAt": datetime.now(),
+        "updatedAt": datetime.now()
+    }
+
+# Status endpoint for exam info generation
+@app.get("/exam-info-generation-status")
+async def get_exam_info_generation_status():
+    """Check the status of exam info generation"""
+    try:
+        total_exam_info = db.exam_info.count_documents({})
+        
+        # Get sample of generated exams
+        sample_exams = list(db.exam_info.find(
+            {},
+            {"name": 1, "category": 1, "difficulty": 1, "totalQuestions": 1, "durationMinutes": 1}
+        ).limit(10))
+        
+        # Remove MongoDB _id
+        for exam in sample_exams:
+            exam.pop('_id', None)
+        
+        return {
+            "total_exam_info_generated": total_exam_info,
+            "status": "In Progress" if total_exam_info < 40 else "Completed",
+            "collection": "test.exam_info",
+            "sample_exams": sample_exams,
+            "recent_count": len(sample_exams)
+        }
+        
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+# Endpoint to list all generated exam info
+@app.get("/list-generated-exam-info")
+async def list_generated_exam_info(limit: int = 50):
+    """List all generated exam information"""
+    try:
+        exams = list(db.exam_info.find(
+            {},
+            {
+                "name": 1,
+                "category": 1,
+                "difficulty": 1,
+                "totalQuestions": 1,
+                "durationMinutes": 1,
+                "participants": 1,
+                "type": 1,
+                "createdAt": 1
+            }
+        ).sort("createdAt", -1).limit(limit))
+        
+        # Group by category
+        category_groups = {}
+        for exam in exams:
+            exam.pop('_id', None)
+            category = exam.get('category', 'General')
+            if category not in category_groups:
+                category_groups[category] = []
+            category_groups[category].append(exam)
+        
+        return {
+            "total_exams": len(exams),
+            "categories_count": len(category_groups),
+            "collection": "test.exam_info",
+            "exams_by_category": category_groups,
+            "summary": {
+                category: len(exams) for category, exams in category_groups.items()
+            }
+        }
+        
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+# Clear exam info endpoint
+@app.delete("/clear-exam-info")
+async def clear_exam_info():
+    """Clear all generated exam information"""
+    try:
+        result = db.exam_info.delete_many({})
+        
+        return {
+            "message": "All exam information cleared",
+            "deleted_count": result.deleted_count,
+            "collection": "test.exam_info"
+        }
+        
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+
+
+
+
+
+# Health check
+@app.get("/health")
+async def health_check():
+    """Health check with Gemini connectivity"""
+    try:
+        generator = GeminiLLMGenerator()
+        test_response = await generator.generate_questions(
+            "Generate a simple test response: 'Gemini is working'"
+        )
+        gemini_status = "connected" if "working" in test_response.lower() else "error"
+    except:
+        gemini_status = "disconnected"
+    
+    return {
+        "status": "healthy",
+        "service": "AWS DVA-C02 Practice Exam Generator",
+        "version": "2.0",
+        "gemini_status": gemini_status,
+        "mongodb_status": "connected" if mongo_client.admin.command('ping') else "disconnected",
+        "database": "aws_prep",
+        "exam_id": "01",
+        "features": [
+            "8 easy practice sets",
+            "8 medium practice sets", 
+            "8 hard practice sets",
+            "65 questions per set",
+            "Gemini LLM integration",
+            "Detailed option explanations",
+            "4 API key rotation"
+        ]
+    }
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)
